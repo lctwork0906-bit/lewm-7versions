@@ -29,6 +29,7 @@ AerialDojo (AerialBench / N_Island_0) → HDF5 转换器
 import os
 import sys
 import json
+import time
 import argparse
 import numpy as np
 from pathlib import Path
@@ -146,22 +147,35 @@ def main():
         episodes = episodes[:args.max_episodes]
     print(f"[preprocess] {len(episodes)} episodes to scan")
 
+    t0 = time.time()
     vox_list, act_list, tok_list = [], [], []
     skipped = 0
-    for ep in episodes:
-        if not (ep.get('status', {}) or {}).get('reached_goal', False):
+    n_ep = len(episodes)
+    for i, ep in enumerate(episodes):
+        ep_id = ep.get('episode_id', f'#{i}')
+        reached = (ep.get('status', {}) or {}).get('reached_goal', False)
+        if not reached:
             skipped += 1
+            print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) elapsed={time.time()-t0:.1f}s",
+                  flush=True)
             continue
         steps = ep.get('steps', [])
+        print(f"[{i+1}/{n_ep}] episode {ep_id} steps={len(steps)} elapsed={time.time()-t0:.1f}s",
+              flush=True)
         for t, step in enumerate(steps):
             if args.max_steps is not None and t >= args.max_steps:
+                print(f"    cap at max_steps={args.max_steps} kept={len(vox_list)} "
+                      f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
                 break
             action = step.get('action')
             if action not in ACTION_MAP:
+                skipped += 1
                 continue
             vox = build_step_voxel(voxelizer, vtransform, step, args.root, ep)
             if vox is None:
                 skipped += 1
+                print(f"    step {t}: voxel=None (missing frame) kept={len(vox_list)} "
+                      f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
                 continue
             vox_list.append(vox.cpu().numpy().astype(np.float32))
             act_list.append([ACTION_MAP[action]])
@@ -174,6 +188,8 @@ def main():
                 desc = f"fly to {goal}"
                 tok_list.append(tokenizer(desc, padding='max_length', truncation=True,
                                            max_length=64, return_tensors='pt')['input_ids'].squeeze(0).numpy())
+            print(f"    step {t}: OK kept={len(vox_list)} skipped={skipped} "
+                  f"elapsed={time.time()-t0:.1f}s", flush=True)
 
     if not vox_list:
         raise RuntimeError("没有得到有效样本，请检查 root / task / split 与录制完整性")
@@ -190,7 +206,7 @@ def main():
         f.attrs['split'] = args.split
         f.attrs['action_map'] = json.dumps(ACTION_MAP)
         f.attrs['voxel_spec'] = json.dumps(vars(spec))
-    print(f"[preprocess] wrote {args.out}")
+    print(f"[preprocess] wrote {args.out}  (total {time.time()-t0:.1f}s)")
     print(f"  voxel : {vox_arr.shape} {vox_arr.dtype}  (C={C})")
     print(f"  action: {act_arr.shape} {act_arr.dtype}")
     print(f"  skipped: {skipped}")
