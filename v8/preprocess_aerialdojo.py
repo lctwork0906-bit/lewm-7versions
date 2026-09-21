@@ -148,69 +148,96 @@ def main():
     print(f"[preprocess] {len(episodes)} episodes to scan")
 
     t0 = time.time()
-    vox_list, act_list, tok_list = [], [], []
     skipped = 0
     n_ep = len(episodes)
-    for i, ep in enumerate(episodes):
-        ep_id = ep.get('episode_id', f'#{i}')
-        reached = (ep.get('status', {}) or {}).get('reached_goal', False)
-        if not reached:
-            skipped += 1
-            print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) elapsed={time.time()-t0:.1f}s",
-                  flush=True)
-            continue
-        steps = ep.get('steps', [])
-        print(f"[{i+1}/{n_ep}] episode {ep_id} steps={len(steps)} elapsed={time.time()-t0:.1f}s",
-              flush=True)
-        for t, step in enumerate(steps):
-            if args.max_steps is not None and t >= args.max_steps:
-                print(f"    cap at max_steps={args.max_steps} kept={len(vox_list)} "
-                      f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
-                break
-            action = step.get('action')
-            if action not in ACTION_MAP:
-                skipped += 1
-                continue
-            vox = build_step_voxel(voxelizer, vtransform, step, args.root, ep)
-            if vox is None:
-                skipped += 1
-                print(f"    step {t}: voxel=None (missing frame) kept={len(vox_list)} "
-                      f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
-                continue
-            vox_list.append(vox.cpu().numpy().astype(np.float32))
-            act_list.append([ACTION_MAP[action]])
-            if args.emit_language:
-                # AerialDojo 的 description 为空，语义目标在 object_name / episode_id 里：
-                #   episode_id = "<start>_to_<goal>"  ->  goal 即 object_<goal>
-                goal = (ep.get('object_name')
-                        or (ep.get('episode_id', '').split('_to_')[-1] if ep.get('episode_id') else None)
-                        or 'target')
-                desc = f"fly to {goal}"
-                tok_list.append(tokenizer(desc, padding='max_length', truncation=True,
-                                           max_length=64, return_tensors='pt')['input_ids'].squeeze(0).numpy())
-            print(f"    step {t}: OK kept={len(vox_list)} skipped={skipped} "
-                  f"elapsed={time.time()-t0:.1f}s", flush=True)
-
-    if not vox_list:
-        raise RuntimeError("没有得到有效样本，请检查 root / task / split 与录制完整性")
-
-    vox_arr = np.stack(vox_list, axis=0)        # (N, C, Z, Y, X)
-    act_arr = np.array(act_list, dtype=np.int64)  # (N, 1)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+
+    # 预创建可扩展数据集：增量 append，避免全量 ~470GB 一次性堆内存导致 OOM。
+    # llm_tokens 强制 int64，绝不把模型名当 dtype 传进去（否则 h5py 会报
+    # np.dtype('prajjwal1/bert-tiny') 的诡异错误）。
     with h5py.File(args.out, 'w') as f:
-        f.create_dataset('voxel', data=vox_arr)
-        f.create_dataset('action', data=act_arr)
-        if tok_list:
-            f.create_dataset('llm_tokens', data=np.stack(tok_list, axis=0))
+        vox_ds = f.create_dataset(
+            'voxel',
+            data=np.zeros((0, C, args.z_cells, args.y_cells, args.x_cells), dtype=np.float32),
+            maxshape=(None, C, args.z_cells, args.y_cells, args.x_cells))
+        act_ds = f.create_dataset('action', data=np.zeros((0, 1), dtype=np.int64),
+                                  maxshape=(None, 1))
+        tok_ds = (f.create_dataset('llm_tokens', data=np.zeros((0, 64), dtype=np.int64),
+                                   maxshape=(None, 64)) if args.emit_language else None)
         f.attrs['task'] = args.task
         f.attrs['split'] = args.split
         f.attrs['action_map'] = json.dumps(ACTION_MAP)
         f.attrs['voxel_spec'] = json.dumps(vars(spec))
+
+        for i, ep in enumerate(episodes):
+            ep_id = ep.get('episode_id', f'#{i}')
+            reached = (ep.get('status', {}) or {}).get('reached_goal', False)
+            if not reached:
+                skipped += 1
+                print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) elapsed={time.time()-t0:.1f}s",
+                      flush=True)
+                continue
+            steps = ep.get('steps', [])
+            print(f"[{i+1}/{n_ep}] episode {ep_id} steps={len(steps)} elapsed={time.time()-t0:.1f}s",
+                  flush=True)
+            evox, eact, etok = [], [], []
+            for t, step in enumerate(steps):
+                if args.max_steps is not None and t >= args.max_steps:
+                    print(f"    cap at max_steps={args.max_steps} kept={len(evox)} "
+                          f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
+                    break
+                action = step.get('action')
+                if action not in ACTION_MAP:
+                    skipped += 1
+                    continue
+                vox = build_step_voxel(voxelizer, vtransform, step, args.root, ep)
+                if vox is None:
+                    skipped += 1
+                    print(f"    step {t}: voxel=None (missing frame) kept={len(evox)} "
+                          f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
+                    continue
+                evox.append(vox.cpu().numpy().astype(np.float32))
+                eact.append([ACTION_MAP[action]])
+                if args.emit_language:
+                    # AerialDojo 的 description 为空，语义目标在 object_name / episode_id 里：
+                    #   episode_id = "<start>_to_<goal>"  ->  goal 即 object_<goal>
+                    goal = (ep.get('object_name')
+                            or (ep.get('episode_id', '').split('_to_')[-1] if ep.get('episode_id') else None)
+                            or 'target')
+                    desc = f"fly to {goal}"
+                    etok.append(tokenizer(desc, padding='max_length', truncation=True,
+                                          max_length=64, return_tensors='pt')['input_ids']
+                                .squeeze(0).numpy().astype(np.int64))
+                print(f"    step {t}: OK kept={len(evox)} skipped={skipped} "
+                      f"elapsed={time.time()-t0:.1f}s", flush=True)
+            # 每个 episode 处理完就落盘一块，峰值内存仅一个 episode 量级，杜绝全量 OOM
+            if evox:
+                vox_arr = np.stack(evox, axis=0).astype(np.float32)
+                act_arr = np.array(eact, dtype=np.int64)
+                n = vox_arr.shape[0]
+                cur = vox_ds.shape[0]
+                vox_ds.resize(cur + n, axis=0); vox_ds[cur:cur + n] = vox_arr
+                act_ds.resize(cur + n, axis=0); act_ds[cur:cur + n] = act_arr
+                if tok_ds is not None and etok:
+                    tok_arr = np.stack(etok, axis=0).astype(np.int64)
+                    tok_ds.resize(cur + n, axis=0); tok_ds[cur:cur + n] = tok_arr
+                print(f"[{i+1}/{n_ep}] appended kept={len(evox)} total={cur + n} "
+                      f"elapsed={time.time()-t0:.1f}s", flush=True)
+
+    # 收尾统计（重新打开读）
+    with h5py.File(args.out, 'r') as f:
+        n = f['voxel'].shape[0]
+        act_all = f['action'][:, 0]
+        has_lang = 'llm_tokens' in f
+    if n == 0:
+        raise RuntimeError("没有得到有效样本，请检查 root / task / split 与录制完整性")
     print(f"[preprocess] wrote {args.out}  (total {time.time()-t0:.1f}s)")
-    print(f"  voxel : {vox_arr.shape} {vox_arr.dtype}  (C={C})")
-    print(f"  action: {act_arr.shape} {act_arr.dtype}")
+    print(f"  voxel : ({n}, {C}, {args.z_cells}, {args.y_cells}, {args.x_cells}) float32  (C={C})")
+    print(f"  action: ({n}, 1) int64")
+    if has_lang:
+        print(f"  llm_tokens: ({n}, 64) int64  ✓")
     print(f"  skipped: {skipped}")
-    print(f"  class counts: " + ", ".join(f"{k}={act_arr[:,0].tolist().count(v)}" for k, v in ACTION_MAP.items()))
+    print(f"  class counts: " + ", ".join(f"{k}={int((act_all == v).sum())}" for k, v in ACTION_MAP.items()))
 
 
 if __name__ == '__main__':
