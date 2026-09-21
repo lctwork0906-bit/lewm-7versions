@@ -1,0 +1,56 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: png_rgbd
+  - model: vla_simple
+
+model_type: vla_simple
+
+output_model_name: vla_simple
+subdir: ${hydra:job.id}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+embed_dim: 64
+history_size: 3
+
+voxel_spec:
+  _target_: core.voxel.VoxelSpec
+  z_cells: 16
+  y_cells: 48
+  x_cells: 48
+  voxel_size: 0.5
+  max_depth: 20.0
+
+img_size: 224
+voxel_size: 224
+
+trainer:
+  max_epochs: 10
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 32
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+wandb:
+  enabled: False

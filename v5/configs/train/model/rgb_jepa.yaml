@@ -1,0 +1,11 @@
+_target_: core.rgb_jepa.RGBDJEPA
+
+img_size: 512
+in_chans: 4
+embed_dim: 192
+dropout: 0.1
+
+action_encoder:
+  _target_: legacy.module.Embedder
+  input_dim: 2
+  emb_dim: 192

@@ -1,0 +1,37 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: png_rgbd
+  - model: rgb_action
+
+model_type: rgb_action
+
+output_model_name: rgb_action
+subdir: ${hydra:job.id}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+img_size: 512
+
+trainer:
+  max_epochs: 10
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 64
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+wandb:
+  enabled: False

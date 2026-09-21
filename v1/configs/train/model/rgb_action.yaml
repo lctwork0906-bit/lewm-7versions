@@ -1,0 +1,6 @@
+_target_: core.rgb_action.RGBDActionModel
+
+img_size: 224
+in_chans: 4
+num_actions: 8
+dropout: 0.3

@@ -1,0 +1,59 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: vla_rgbd
+  - model: vla_jepa
+
+model_type: vla
+img_size: 224
+voxel_size: 224
+
+output_model_name: vla_jepa
+subdir: ${hydra:job.id}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+embed_dim: 64
+history_size: 3
+
+voxel_spec:
+  _target_: core.voxel.VoxelSpec
+  z_cells: 8
+  y_cells: 24
+  x_cells: 24
+  voxel_size: 1.0
+  max_depth: 20.0
+
+llm:
+  model_name: gpt2
+  max_length: 64
+
+trainer:
+  max_epochs: 50
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 16
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 1e-3
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+wandb:
+  enabled: False

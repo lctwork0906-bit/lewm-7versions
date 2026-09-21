@@ -1,0 +1,10 @@
+_target_: core.rgb_vla.RGBVLA
+
+img_size: 512
+in_chans: 4
+num_actions: 8
+dropout: 0.3
+llm_model_name: prajjwal1/bert-tiny
+llm_dim: 128
+num_heads: 4
+freeze_llm: False
