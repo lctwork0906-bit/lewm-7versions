@@ -1,0 +1,48 @@
+_target_: core.vla_jepa.VLAJEPA
+
+llm_model_name: google/bert_uncased_L-2_H-128_A-2
+llm_dim: 128
+freeze_llm: True
+num_heads: 4
+use_adaln: False
+
+jepa_encoder:
+  _target_: core.voxel.VoxelJEPAEncoder
+  spec: ${voxel_spec}
+  latent_dim: ${embed_dim}
+
+jepa_predictor:
+  _target_: legacy.module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: legacy.module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: legacy.module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: legacy.module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

@@ -1,0 +1,10 @@
+dataset:
+  num_steps: 4
+  frameskip: 1
+  name: /villa/lct25-srt/rgbd_test.h5
+  keys_to_load:
+    - voxel
+    - action
+  keys_to_cache:
+    - action
+  voxel_key: voxel

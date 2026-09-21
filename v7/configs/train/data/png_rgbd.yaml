@@ -1,0 +1,9 @@
+dataset:
+  num_steps: 1
+  frameskip: 1
+  name: /DATA/DATANAS2/jzq26/DATA/collected_vla/
+  keys_to_load:
+    - pixels
+    - action
+  keys_to_cache:
+    - action
