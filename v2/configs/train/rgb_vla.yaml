@@ -1,0 +1,37 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: png_rgbd
+  - model: rgb_vla
+
+model_type: rgb_vla
+
+output_model_name: rgb_vla
+subdir: ${hydra:job.id}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+img_size: 512
+
+trainer:
+  max_epochs: 1
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 32
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+wandb:
+  enabled: False
