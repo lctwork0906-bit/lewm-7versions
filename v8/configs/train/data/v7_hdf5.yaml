@@ -1,0 +1,11 @@
+dataset:
+  num_steps: 1
+  frameskip: 1
+  name: /villa/lct25-srt/v7_preprocessed.h5
+  keys_to_load:
+    - pixels
+    - depth
+    - action
+    - llm_tokens
+  keys_to_cache:
+    - action

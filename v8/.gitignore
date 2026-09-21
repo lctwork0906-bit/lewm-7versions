@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.h5
+*.zst
+*.pt
+*.ckpt
+logs/
+outputs/
+*.log
+.DS_Store

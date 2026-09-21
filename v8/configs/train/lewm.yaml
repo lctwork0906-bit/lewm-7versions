@@ -1,0 +1,60 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: pusht
+  - model: lewm
+
+output_model_name: lewm
+subdir: ${hydra:job.id}
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+img_size: 224
+embed_dim: 192
+history_size: 3
+
+# 体素规格（voxel / vla / vla_simple 模型共用）。
+# 默认保持原行为：3 通道纯几何、16×48×48 @ 0.5m、12×12 采样。
+# 想启用颜色+高分辨率（A100），见 lewm_voxel.yaml 的覆盖或自行改这里：
+#   use_color: true, samples: 48, z_cells:32, y_cells:96, x_cells:96, voxel_size:0.25
+voxel_spec:
+  z_cells: 16
+  y_cells: 48
+  x_cells: 48
+  voxel_size: 0.5
+  max_depth: 20.0
+  z_min: -4.0
+  use_color: false
+  samples: 12
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+num_preds: 1
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+wandb:
+  enabled: False

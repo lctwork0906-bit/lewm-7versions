@@ -1,0 +1,12 @@
+dataset:
+  num_steps: 3            # = history_size
+  frameskip: 1
+  name: data/aerialdojo_base_train.h5
+  keys_to_load:
+    - voxel
+    - action
+    - llm_tokens         # 由 preprocess_aerialdojo.py --emit_language 写入（object_name 派生）
+  keys_to_cache:
+    - action
+    - llm_tokens
+  voxel_key: voxel

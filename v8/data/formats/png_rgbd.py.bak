@@ -1,0 +1,199 @@
+import os
+import cv2
+import json
+import torch
+import numpy as np
+from torch.utils.data import Dataset
+from ..base import DataFormatStrategy
+from ..transforms.voxelize import VoxelizeTransform
+
+ACTION_MAP = {
+    'forward': 0,
+    'left': 1,
+    'right': 2,
+    'descend': 3,
+    'ascend': 4,
+    'rotl': 5,
+    'rotr': 6,
+    'stop': 7,
+}
+
+
+class PNGDepthDataset(Dataset):
+    def __init__(self, root_dir, num_steps=1, transform=None, tokenizer=None, max_length=64):
+        self.root_dir = root_dir
+        self.num_steps = num_steps
+        self.transform = transform
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self._load_metadata()
+        # 预计算所有 description 的 token
+        self._precompute_tokens()
+
+    def _load_metadata(self):
+        self.tasks = []
+        json_files = [f for f in os.listdir(self.root_dir) if f.endswith('.json')]
+        print(f"Found {len(json_files)} JSON files in {self.root_dir}")
+
+        for json_path in json_files:
+            json_path = os.path.join(self.root_dir, json_path)
+            try:
+                with open(json_path, 'r') as f:
+                    content = f.read()
+                    for line in content.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line.strip(), strict=False)
+                            if 'steps' in data and data['steps']:
+                                scene = data.get('map_name', 'unknown')
+                                description = data.get('description', '')
+                                for step_idx, step in enumerate(data['steps']):
+                                    if 'rgb' in step and 'front' in step['rgb']:
+                                        rgb_rel = step['rgb']['front']
+                                        if rgb_rel.startswith('DATA/collected_vla/'):
+                                            rgb_rel = rgb_rel[len('DATA/collected_vla/'):]
+                                        rgb_path = os.path.join(self.root_dir, rgb_rel)
+                                        if os.path.exists(rgb_path):
+                                            self.tasks.append({
+                                                'scene': scene,
+                                                'episode_id': data.get('episode_id', 'unknown'),
+                                                'step_idx': step_idx,
+                                                'action': step.get('action', 'stop'),
+                                                'description': description,
+                                                'rgb_path': rgb_path,
+                                                'depth_paths': {
+                                                    'front': os.path.join(self.root_dir, step['depth']['front'].replace('DATA/collected_vla/', '')) if 'depth' in step and 'front' in step['depth'] else None,
+                                                    'left': os.path.join(self.root_dir, step['depth']['left'].replace('DATA/collected_vla/', '')) if 'depth' in step and 'left' in step['depth'] else None,
+                                                    'right': os.path.join(self.root_dir, step['depth']['right'].replace('DATA/collected_vla/', '')) if 'depth' in step and 'right' in step['depth'] else None,
+                                                    'down': os.path.join(self.root_dir, step['depth']['down'].replace('DATA/collected_vla/', '')) if 'depth' in step and 'down' in step['depth'] else None,
+                                                },
+                                                'rgb_paths': {
+                                                    'front': os.path.join(self.root_dir, step['rgb']['front'].replace('DATA/collected_vla/', '')) if 'rgb' in step and 'front' in step['rgb'] else None,
+                                                    'left': os.path.join(self.root_dir, step['rgb']['left'].replace('DATA/collected_vla/', '')) if 'rgb' in step and 'left' in step['rgb'] else None,
+                                                    'right': os.path.join(self.root_dir, step['rgb']['right'].replace('DATA/collected_vla/', '')) if 'rgb' in step and 'right' in step['rgb'] else None,
+                                                    'down': os.path.join(self.root_dir, step['rgb']['down'].replace('DATA/collected_vla/', '')) if 'rgb' in step and 'down' in step['rgb'] else None,
+                                                },
+                                            })
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                continue
+        print(f"Found {len(self.tasks)} valid RGB-D samples")
+
+    def _precompute_tokens(self):
+        """预计算所有 description 的 token，避免多进程崩溃"""
+        self._cached_tokens = {}
+        if self.tokenizer is not None:
+            descriptions = set(task['description'] for task in self.tasks)
+            print(f"Precomputing tokens for {len(descriptions)} unique descriptions...")
+            for desc in descriptions:
+                if desc:
+                    tokens = self.tokenizer(
+                        desc,
+                        padding='max_length',
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_tensors='pt'
+                    )
+                    self._cached_tokens[desc] = tokens['input_ids'].squeeze(0)
+                else:
+                    self._cached_tokens[desc] = torch.zeros(self.max_length, dtype=torch.long)
+        print(f"Token cache ready: {len(self._cached_tokens)} entries")
+
+    def __len__(self):
+        return len(self.tasks)
+
+    def _load_image(self, path):
+        img = cv2.imread(path)
+        if img is None:
+            return None
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def _load_depth(self, path):
+        if path is None or not os.path.exists(path):
+            return None
+        depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            return None
+        return depth.astype(np.float32) / 65535.0
+
+    def _compute_collision_risk(self, task):
+        # 简化：返回0
+        return 0.0
+
+    def __getitem__(self, idx):
+        task = self.tasks[idx]
+        
+        # 加载 RGB（4视角）
+        rgb_paths = task['rgb_paths']
+        rgb_frames = []
+        for angle in ['front', 'left', 'right', 'down']:
+            img = self._load_image(rgb_paths[angle])
+            if img is not None:
+                rgb_frames.append(torch.from_numpy(img).permute(2, 0, 1).float())
+        if not rgb_frames:
+            raise ValueError(f"No RGB images found for task {idx}")
+        rgb = torch.stack(rgb_frames, dim=0)  # (4, 3, H, W)
+
+        # 加载 Depth（4视角）
+        depth_paths = task['depth_paths']
+        depth_frames = []
+        for angle in ['front', 'left', 'right', 'down']:
+            depth = self._load_depth(depth_paths[angle])
+            if depth is not None:
+                depth_frames.append(torch.from_numpy(depth).float())
+        if not depth_frames:
+            raise ValueError(f"No depth images found for task {idx}")
+        depth = torch.stack(depth_frames, dim=0)  # (4, H, W)
+
+        # 动作
+        action_str = task.get('action', 'stop')
+        action_idx = ACTION_MAP.get(action_str, ACTION_MAP['stop'])
+        action = torch.tensor([action_idx], dtype=torch.long)
+
+        collision_risk = self._compute_collision_risk(task)
+
+        # 语言指令：从缓存获取，避免多进程崩溃
+        description = task.get('description', '')
+        if self._cached_tokens and description in self._cached_tokens:
+            llm_tokens = self._cached_tokens[description]
+        else:
+            llm_tokens = torch.zeros(self.max_length, dtype=torch.long)
+
+        data = {
+            'pixels': rgb,
+            'depth': depth,
+            'action': action,
+            'llm_tokens': llm_tokens,
+        }
+
+        if self.transform:
+            data = self.transform(data)
+
+        return data
+
+
+class PNGDepthStrategy(DataFormatStrategy):
+    def detect(self, path):
+        return os.path.isdir(path) and any(f.endswith('.json') for f in os.listdir(path))
+
+    def load(self, path, **kwargs):
+        keys_to_load = kwargs.get('keys_to_load', ['pixels', 'action'])
+        transform = kwargs.get('transform', None)
+        num_steps = kwargs.get('num_steps', 1)
+        tokenizer = kwargs.get('tokenizer', None)
+        max_length = kwargs.get('max_length', 64)
+        return PNGDepthDataset(path, num_steps, transform, tokenizer, max_length)
+
+    def get_input_channels(self):
+        return 4
+
+    def get_transform(self, img_size):
+        return None
+
+    def get_column_names(self):
+        return ['pixels', 'depth', 'action', 'llm_tokens']
+
+    def get_name(self):
+        return "PNG-RGBD"

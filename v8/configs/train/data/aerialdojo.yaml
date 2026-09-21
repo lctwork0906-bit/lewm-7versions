@@ -1,0 +1,10 @@
+dataset:
+  num_steps: 3            # = history_size；必须与顶层 history_size 一致（JEPA3D 需要 T>=2 才能形成 6 维 (B,T,C,Z,Y,X)）
+  frameskip: 1
+  name: data/aerialdojo_base_train.h5
+  keys_to_load:
+    - voxel
+    - action
+  keys_to_cache:
+    - action
+  voxel_key: voxel

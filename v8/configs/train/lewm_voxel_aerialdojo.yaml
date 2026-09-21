@@ -1,0 +1,61 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: aerialdojo
+  - model: lewm_3d
+
+model_type: voxel                 # -> core.trainer 走 JEPA3D 分支（你 v4 用的那个），新 VoxelJEPAEncoder 已接入
+
+output_model_name: lewm_voxel_aerialdojo
+subdir: ${hydra:job.id}
+
+num_workers: 4
+train_split: 0.9
+seed: 3072
+embed_dim: 64
+history_size: 3
+
+# 体素规格：A100 升级档（开颜色 + 分辨率翻倍）。
+# ⚠️ 必须与 preprocess_aerialdojo.py 的 --z_cells/--y_cells/--x_cells/--voxel_size/--use_color/--samples 完全一致！
+# 通道数自动变为 6：[占据, 自由, 归一深度, R, G, B]。
+# 此配置下训练出的 checkpoint 为 6 通道，旧 3 通道权重不兼容，需重训。
+voxel_spec:
+  z_cells: 32
+  y_cells: 96
+  x_cells: 96
+  voxel_size: 0.25
+  max_depth: 20.0
+  z_min: -4.0
+  use_color: true
+  samples: 48
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 32
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+num_preds: 1
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+wandb:
+  enabled: False
