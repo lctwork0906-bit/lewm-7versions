@@ -203,7 +203,7 @@ class HDF5RGBDVoxelStrategy(DataFormatStrategy):
 
     def get_transform(self, spec=None):
         """返回体素转换 transform（使用给定/已记录的 spec）"""
-        from .transforms.voxelize import VoxelizeTransform
+        # VoxelizeTransform 已在文件顶部 import；它对预计算 voxel 数据是安全空操作
         return VoxelizeTransform(spec or self.voxel_spec)
 
     def get_column_names(self) -> list:

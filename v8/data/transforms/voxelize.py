@@ -9,6 +9,10 @@ class VoxelizeTransform:
         self.in_channels = self.spec.in_channels
 
     def __call__(self, data):
+        # 数据已自带预计算体素（'voxel'），无需再 voxelize，直接透传。
+        # 否则（仅带 raw pixels/depth 的文件）才执行 voxelization。
+        if 'voxel' in data:
+            return data
         if 'rgb' in data and 'depth' in data:
             rgb = data['rgb']
             depth = data['depth']
