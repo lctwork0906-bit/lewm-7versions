@@ -6,18 +6,23 @@ AerialDojo (AerialBench / N_Island_0) → HDF5 转换器
     action: (N, 1)           int64     下一步动作索引（6 类）
     [llm_tokens]: (N, 64)    int64     --emit_language 时填（JEPA3D 不用，留给 VLA）
 
-用法（在服务器、v7 目录下运行，需 torch + h5py + Pillow + transformers）：
+用法（在服务器、v8 目录下运行，需 torch + h5py + Pillow + transformers）：
     # 先小跑 2 条轨迹验证
     python preprocess_aerialdojo.py \
         --root /DATA/DATANAS1/UE_EXE/TASKS_Record_5GPU \
         --task BaseTasks --split Trainset \
         --out data/aerialdojo_base_train.h5 \
         --max_episodes 2 --max_steps 20
-    # 全量
+    # 单台多核全量（workers = 该服务器逻辑核数，比如 32）
     python preprocess_aerialdojo.py \
         --root /DATA/DATANAS1/UE_EXE/TASKS_Record_5GPU \
         --task BaseTasks --split Trainset \
-        --out data/aerialdojo_base_train.h5
+        --out data/aerialdojo_base_train.h5 \
+        --emit_language --workers 32
+    # 多服务器分片（每台写独立 shard，最后合并）：
+    #   server0: --episode_offset 0    --episode_count 392 --out .../shard0.h5
+    #   server1: --episode_offset 392  --episode_count 392 --out .../shard1.h5
+    #   server2: --episode_offset 784  --episode_count 392 --out .../shard2.h5
 
 注意：
 - 体素 spec 必须与训练 config（lewm_voxel_aerialdojo.yaml 的 voxel_spec）保持一致！
@@ -25,6 +30,8 @@ AerialDojo (AerialBench / N_Island_0) → HDF5 转换器
 - AerialDojo 动作只有 6 类（forward/ascend/descend/rotl/rotr/stop），这里用 6 类映射。
 - 深度 0 或 ~65.535m 视为无效，统一置为 1e3（被 voxelizer 按 max_depth 截断成"无近表面"）。
 - 只收录 status.reached_goal == True 的轨迹，且每步四视角齐全才入库。
+- --workers > 1 走 multiprocessing（Linux fork，子进程继承 tokenizer/voxelizer，无需重加载）；
+  内存上限约为 (workers 个 episode 的 voxel) 量级，遇到 OOM 就调小 --workers。
 """
 import os
 import sys
@@ -34,7 +41,7 @@ import argparse
 import numpy as np
 from pathlib import Path
 
-# 让 `from core.xxx` / `from data.xxx` 可导入（从 v7 目录运行）
+# 让 `from core.xxx` / `from data.xxx` 可导入（从 v8 目录运行）
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
@@ -55,6 +62,12 @@ ACTION_MAP = {
     'stop': 5,
 }
 CAMERAS = ['front', 'left', 'right', 'down']
+
+# 多进程 worker 通过模块全局变量拿到 voxelizer / transform / tokenizer（Linux fork 继承）
+G_ARGS = None
+G_VOX = None
+G_VTR = None
+G_TOK = None
 
 
 def resolve_frame_path(root, ep, saved_path, modality):
@@ -99,6 +112,58 @@ def build_step_voxel(voxelizer, vtransform, step, root, ep):
     return vtransform._combine_views(voxels)  # (C, Z, Y, X)
 
 
+def process_episode_core(ep):
+    """处理单个 episode，返回 (ep_id, evox_list, eact_list, etok_list)。
+    reached_goal=False 时 evox_list 为 None（标记跳过）；否则为列表（可能为空）。"""
+    args, voxelizer, vtransform, tokenizer = G_ARGS, G_VOX, G_VTR, G_TOK
+    ep_id = ep.get('episode_id', '?')
+    reached = (ep.get('status', {}) or {}).get('reached_goal', False)
+    if not reached:
+        return (ep_id, None, None, None)
+    evox, eact, etok = [], [], []
+    steps = ep.get('steps', [])
+    for t, step in enumerate(steps):
+        if args.max_steps is not None and t >= args.max_steps:
+            break
+        action = step.get('action')
+        if action not in ACTION_MAP:
+            continue
+        vox = build_step_voxel(voxelizer, vtransform, step, args.root, ep)
+        if vox is None:
+            continue
+        evox.append(vox.cpu().numpy().astype(np.float32))
+        eact.append([ACTION_MAP[action]])
+        if args.emit_language:
+            # AerialDojo 的 description 为空，语义目标在 object_name / episode_id 里：
+            #   episode_id = "<start>_to_<goal>"  ->  goal 即 object_<goal>
+            goal = (ep.get('object_name')
+                    or (ep.get('episode_id', '').split('_to_')[-1] if ep.get('episode_id') else None)
+                    or 'target')
+            desc = f"fly to {goal}"
+            etok.append(tokenizer(desc, padding='max_length', truncation=True,
+                                  max_length=64, return_tensors='pt')['input_ids']
+                        .squeeze(0).numpy().astype(np.int64))
+    return (ep_id, evox, eact, etok)
+
+
+def write_episode(vox_ds, act_ds, tok_ds, evox, eact, etok, i, n_ep, t0):
+    """把单个 episode 的样本增量 append 进 HDF5，并打印进度。"""
+    vox_arr = np.stack(evox, axis=0).astype(np.float32)
+    act_arr = np.array(eact, dtype=np.int64)
+    n = vox_arr.shape[0]
+    cur = vox_ds.shape[0]
+    vox_ds.resize(cur + n, axis=0)
+    vox_ds[cur:cur + n] = vox_arr
+    act_ds.resize(cur + n, axis=0)
+    act_ds[cur:cur + n] = act_arr
+    if tok_ds is not None and etok:
+        tok_arr = np.stack(etok, axis=0).astype(np.int64)
+        tok_ds.resize(cur + n, axis=0)
+        tok_ds[cur:cur + n] = tok_arr
+    print(f"[{i+1}/{n_ep}] appended kept={n} total={cur + n} elapsed={time.time()-t0:.1f}s",
+          flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--root', default='/DATA/DATANAS1/UE_EXE/TASKS_Record_5GPU')
@@ -119,6 +184,14 @@ def main():
     ap.add_argument('--max_steps', type=int, default=None)
     ap.add_argument('--emit_language', action='store_true',
                     help='把 object_name 写成 llm_tokens（JEPA3D 不用，留给 VLA）')
+    # 分片（多服务器并行用）
+    ap.add_argument('--episode_offset', type=int, default=0,
+                    help='分片起点 episode 序号（多服务器并行用）')
+    ap.add_argument('--episode_count', type=int, default=None,
+                    help='本分片最多处理的 episode 数（None=到末尾）')
+    # 多核加速
+    ap.add_argument('--workers', type=int, default=1,
+                    help='并行进程数（>1 走 multiprocessing；Linux fork 继承 tokenizer/voxelizer）')
     # 必须与 configs/train/model/vla_jepa.yaml 的 llm_model_name 完全一致！
     # 否则写出的 llm_tokens（token id）喂进 LLM 时词表对不上，语义全乱。
     ap.add_argument('--llm_model_name', default='prajjwal1/bert-tiny',
@@ -143,13 +216,24 @@ def main():
     print(f"[preprocess] reading index: {index_path}")
     with open(index_path, 'r') as f:
         episodes = json.load(f)  # JSON 数组
+
+    # 只收 reached_goal==True 的轨迹，再按分片 / max_episodes 切片
+    episodes = [e for e in episodes if (e.get('status', {}) or {}).get('reached_goal', False)]
+    episodes = episodes[args.episode_offset:]
+    if args.episode_count is not None:
+        episodes = episodes[:args.episode_count]
     if args.max_episodes is not None:
         episodes = episodes[:args.max_episodes]
-    print(f"[preprocess] {len(episodes)} episodes to scan")
+    n_ep = len(episodes)
+    print(f"[preprocess] {n_ep} episodes to scan "
+          f"(offset={args.episode_offset} count={args.episode_count} workers={args.workers})")
+
+    # 把全局句柄交给模块变量，worker（fork）可直接继承，无需重加载
+    global G_ARGS, G_VOX, G_VTR, G_TOK
+    G_ARGS, G_VOX, G_VTR, G_TOK = args, voxelizer, vtransform, tokenizer
 
     t0 = time.time()
     skipped = 0
-    n_ep = len(episodes)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     # 预创建可扩展数据集：增量 append，避免全量 ~470GB 一次性堆内存导致 OOM。
@@ -169,60 +253,40 @@ def main():
         f.attrs['action_map'] = json.dumps(ACTION_MAP)
         f.attrs['voxel_spec'] = json.dumps(vars(spec))
 
-        for i, ep in enumerate(episodes):
-            ep_id = ep.get('episode_id', f'#{i}')
-            reached = (ep.get('status', {}) or {}).get('reached_goal', False)
-            if not reached:
-                skipped += 1
-                print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) elapsed={time.time()-t0:.1f}s",
-                      flush=True)
-                continue
-            steps = ep.get('steps', [])
-            print(f"[{i+1}/{n_ep}] episode {ep_id} steps={len(steps)} elapsed={time.time()-t0:.1f}s",
-                  flush=True)
-            evox, eact, etok = [], [], []
-            for t, step in enumerate(steps):
-                if args.max_steps is not None and t >= args.max_steps:
-                    print(f"    cap at max_steps={args.max_steps} kept={len(evox)} "
-                          f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
-                    break
-                action = step.get('action')
-                if action not in ACTION_MAP:
+        if args.workers and args.workers > 1:
+            from concurrent.futures import ProcessPoolExecutor
+            # 分批提交，限制同时在飞的 episode 数（≈ workers 个），避免结果堆积撑爆内存
+            CH = max(args.workers, 8)
+            with ProcessPoolExecutor(max_workers=args.workers) as ex:
+                for s in range(0, n_ep, CH):
+                    batch = episodes[s:s + CH]
+                    for j, (ep_id, evox, eact, etok) in enumerate(ex.map(process_episode_core, batch)):
+                        i = s + j
+                        if evox is None:
+                            skipped += 1
+                            print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) "
+                                  f"elapsed={time.time()-t0:.1f}s", flush=True)
+                            continue
+                        if not evox:
+                            skipped += 1
+                            print(f"[{i+1}/{n_ep}] SKIP {ep_id} (no valid steps) "
+                                  f"elapsed={time.time()-t0:.1f}s", flush=True)
+                            continue
+                        write_episode(vox_ds, act_ds, tok_ds, evox, eact, etok, i, n_ep, t0)
+        else:
+            for i, ep in enumerate(episodes):
+                ep_id, evox, eact, etok = process_episode_core(ep)
+                if evox is None:
                     skipped += 1
+                    print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) "
+                          f"elapsed={time.time()-t0:.1f}s", flush=True)
                     continue
-                vox = build_step_voxel(voxelizer, vtransform, step, args.root, ep)
-                if vox is None:
+                if not evox:
                     skipped += 1
-                    print(f"    step {t}: voxel=None (missing frame) kept={len(evox)} "
-                          f"skipped={skipped} elapsed={time.time()-t0:.1f}s", flush=True)
+                    print(f"[{i+1}/{n_ep}] SKIP {ep_id} (no valid steps) "
+                          f"elapsed={time.time()-t0:.1f}s", flush=True)
                     continue
-                evox.append(vox.cpu().numpy().astype(np.float32))
-                eact.append([ACTION_MAP[action]])
-                if args.emit_language:
-                    # AerialDojo 的 description 为空，语义目标在 object_name / episode_id 里：
-                    #   episode_id = "<start>_to_<goal>"  ->  goal 即 object_<goal>
-                    goal = (ep.get('object_name')
-                            or (ep.get('episode_id', '').split('_to_')[-1] if ep.get('episode_id') else None)
-                            or 'target')
-                    desc = f"fly to {goal}"
-                    etok.append(tokenizer(desc, padding='max_length', truncation=True,
-                                          max_length=64, return_tensors='pt')['input_ids']
-                                .squeeze(0).numpy().astype(np.int64))
-                print(f"    step {t}: OK kept={len(evox)} skipped={skipped} "
-                      f"elapsed={time.time()-t0:.1f}s", flush=True)
-            # 每个 episode 处理完就落盘一块，峰值内存仅一个 episode 量级，杜绝全量 OOM
-            if evox:
-                vox_arr = np.stack(evox, axis=0).astype(np.float32)
-                act_arr = np.array(eact, dtype=np.int64)
-                n = vox_arr.shape[0]
-                cur = vox_ds.shape[0]
-                vox_ds.resize(cur + n, axis=0); vox_ds[cur:cur + n] = vox_arr
-                act_ds.resize(cur + n, axis=0); act_ds[cur:cur + n] = act_arr
-                if tok_ds is not None and etok:
-                    tok_arr = np.stack(etok, axis=0).astype(np.int64)
-                    tok_ds.resize(cur + n, axis=0); tok_ds[cur:cur + n] = tok_arr
-                print(f"[{i+1}/{n_ep}] appended kept={len(evox)} total={cur + n} "
-                      f"elapsed={time.time()-t0:.1f}s", flush=True)
+                write_episode(vox_ds, act_ds, tok_ds, evox, eact, etok, i, n_ep, t0)
 
     # 收尾统计（重新打开读）
     with h5py.File(args.out, 'r') as f:
