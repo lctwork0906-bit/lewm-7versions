@@ -68,6 +68,7 @@ G_ARGS = None
 G_VOX = None
 G_VTR = None
 G_TOK = None
+G_DESC_MAP = None  # object_name -> 真实语义描述（来自根目录 collected_episodes.jsonl）
 
 
 def resolve_frame_path(root, ep, saved_path, modality):
@@ -116,6 +117,7 @@ def process_episode_core(ep):
     """处理单个 episode，返回 (ep_id, evox_list, eact_list, etok_list)。
     reached_goal=False 时 evox_list 为 None（标记跳过）；否则为列表（可能为空）。"""
     args, voxelizer, vtransform, tokenizer = G_ARGS, G_VOX, G_VTR, G_TOK
+    desc_map = G_DESC_MAP
     ep_id = ep.get('episode_id', '?')
     reached = (ep.get('status', {}) or {}).get('reached_goal', False)
     if not reached:
@@ -134,12 +136,17 @@ def process_episode_core(ep):
         evox.append(vox.cpu().numpy().astype(np.float32))
         eact.append([ACTION_MAP[action]])
         if args.emit_language:
-            # AerialDojo 的 description 为空，语义目标在 object_name / episode_id 里：
-            #   episode_id = "<start>_to_<goal>"  ->  goal 即 object_<goal>
-            goal = (ep.get('object_name')
-                    or (ep.get('episode_id', '').split('_to_')[-1] if ep.get('episode_id') else None)
-                    or 'target')
-            desc = f"fly to {goal}"
+            # 真实语义描述来自 --root 下的 collected_episodes.jsonl（按 object_name 对齐）。
+            # BaseTasks/Trainset 里的 collected_episodes.json 的 description 被清空了，
+            # 所以必须查 jsonl；查不到时才退化为 "fly to <object>"。
+            on = ep.get('object_name')
+            real_desc = desc_map.get(on) if desc_map else None
+            if real_desc:
+                desc = real_desc
+            else:
+                goal = (on or (ep.get('episode_id', '').split('_to_')[-1]
+                               if ep.get('episode_id') else None) or 'target')
+                desc = f"fly to {goal}"
             etok.append(tokenizer(desc, padding='max_length', truncation=True,
                                   max_length=64, return_tensors='pt')['input_ids']
                         .squeeze(0).numpy().astype(np.int64))
@@ -183,7 +190,7 @@ def main():
     ap.add_argument('--max_episodes', type=int, default=None)
     ap.add_argument('--max_steps', type=int, default=None)
     ap.add_argument('--emit_language', action='store_true',
-                    help='把 object_name 写成 llm_tokens（JEPA3D 不用，留给 VLA）')
+                    help='把真实物体描述(jsonl)写成 llm_tokens（JEPA3D 不用，留给 VLA）')
     # 分片（多服务器并行用）
     ap.add_argument('--episode_offset', type=int, default=0,
                     help='分片起点 episode 序号（多服务器并行用）')
@@ -228,9 +235,31 @@ def main():
     print(f"[preprocess] {n_ep} episodes to scan "
           f"(offset={args.episode_offset} count={args.episode_count} workers={args.workers})")
 
+    # 语言分支：真实语义描述来自 --root 下的 collected_episodes.jsonl
+    # （BaseTasks/Trainset/collected_episodes.json 的 description 是空的，必须用 jsonl 这份）。
+    # 按 object_name 建索引；jsonl 有 4025 行、79 个唯一 object_name，全部带描述。
+    desc_map = {}
+    if args.emit_language:
+        jsonl_path = os.path.join(args.root, 'collected_episodes.jsonl')
+        if os.path.isfile(jsonl_path):
+            with open(jsonl_path, 'r') as fj:
+                for line in fj:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    e = json.loads(line)
+                    on = e.get('object_name')
+                    d = e.get('description')
+                    if on and d:
+                        desc_map[str(on)] = d
+            print(f"[preprocess] loaded {len(desc_map)} object descriptions "
+                  f"from {jsonl_path}")
+        else:
+            print(f"[preprocess] WARNING: {jsonl_path} 不存在，语言将退化为 'fly to <object>'")
+
     # 把全局句柄交给模块变量，worker（fork）可直接继承，无需重加载
-    global G_ARGS, G_VOX, G_VTR, G_TOK
-    G_ARGS, G_VOX, G_VTR, G_TOK = args, voxelizer, vtransform, tokenizer
+    global G_ARGS, G_VOX, G_VTR, G_TOK, G_DESC_MAP
+    G_ARGS, G_VOX, G_VTR, G_TOK, G_DESC_MAP = args, voxelizer, vtransform, tokenizer, desc_map
 
     t0 = time.time()
     skipped = 0
