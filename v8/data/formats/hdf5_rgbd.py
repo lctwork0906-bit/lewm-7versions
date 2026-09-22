@@ -38,7 +38,15 @@ class HDF5RGBDDataset(Dataset):
 
 class HDF5RGBDStrategy(DataFormatStrategy):
     def detect(self, path):
-        return path.endswith('.h5')
+        # 必须真的含有 RGB-D 像素/深度键，避免把"只有 voxel"的体素 HDF5 误判成 RGB-D
+        # （否则 HDF5RGBDDataset 会因找不到 'pixels' 而 KeyError）。
+        if not path.endswith('.h5'):
+            return False
+        try:
+            with h5py.File(path, 'r') as f:
+                return ('pixels' in f) and ('depth' in f or 'weight' in f)
+        except Exception:
+            return False
     
     def load(self, path, **kwargs):
         transform = kwargs.get('transform', None)

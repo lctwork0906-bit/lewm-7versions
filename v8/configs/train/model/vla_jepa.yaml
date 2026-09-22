@@ -6,7 +6,7 @@ freeze_llm: True
 num_heads: 4
 use_adaln: False
 jepa_token_dim: 128
-num_actions: 8
+num_actions: 6  # AerialDojo 只有 6 类动作（forward/ascend/descend/rotl/rotr/stop），必须与数据对齐
 
 jepa_encoder:
   _target_: core.voxel.VoxelJEPAEncoder

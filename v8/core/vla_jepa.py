@@ -96,7 +96,18 @@ class VLAJEPA(nn.Module):
         # ---- JEPA 预测损失（世界模型分支，不变）----
         if T > 1:
             ctx_emb = jepa_emb[:, :T - 1]
-            action_seq = batch.get('action_sequence', torch.zeros(B, T - 1, 8, device=device))
+            # 动作序列：优先用数据集提供的 action_sequence；否则从堆叠的 action 历史派生。
+            # action 形状 (B, T, D)，D = action_encoder.input_dim（运行时设为 1），
+            # 不能硬编码 8，否则 Embedder 的 Conv1d(input_dim=1) 收到末维=8 会 shape 报错。
+            if 'action_sequence' in batch:
+                action_seq = batch['action_sequence']
+            else:
+                act = batch['action']
+                if act.dim() == 1:
+                    act = act.unsqueeze(0).unsqueeze(-1)          # (B,) -> (1, 1, 1)
+                elif act.dim() == 2:
+                    act = act.unsqueeze(-1)                        # (B, T) -> (B, T, 1)
+                action_seq = act[:, :T - 1] if act.shape[1] > T - 1 else act
             ctx_act = self.action_encoder(action_seq)
             pred_emb = self.jepa_predictor(ctx_emb, ctx_act)
             pred_emb = self.pred_proj(rearrange(pred_emb, "b t d -> (b t) d"))
