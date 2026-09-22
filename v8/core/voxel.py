@@ -182,7 +182,8 @@ class VoxelJEPAEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.token_dim = token_dim
         self.num_stages = num_stages
-        self.in_channels = getattr(spec, 'in_channels', 3)
+        # voxel_spec 可能是 Hydra 字典（无 in_channels 属性），按 use_color 推算：开颜色=6，否则=3
+        self.in_channels = 6 if getattr(spec, 'use_color', False) else 3
 
         # ---- 3D 卷积骨干：逐级下采样，保持空间结构 ----
         stages = []

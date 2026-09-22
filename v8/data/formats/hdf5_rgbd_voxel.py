@@ -196,9 +196,9 @@ class HDF5RGBDVoxelStrategy(DataFormatStrategy):
         )
 
     def get_input_channels(self) -> int:
-        """体素通道数：开颜色=6，否则=3"""
+        """体素通道数：开颜色=6，否则=3（voxel_spec 是纯字典，无 in_channels 属性，按 use_color 推算）"""
         if self.voxel_spec is not None:
-            return getattr(self.voxel_spec, 'in_channels', 3)
+            return 6 if getattr(self.voxel_spec, 'use_color', False) else 3
         return 3
 
     def get_transform(self, spec=None):

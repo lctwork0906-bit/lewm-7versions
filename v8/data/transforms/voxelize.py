@@ -6,7 +6,9 @@ class VoxelizeTransform:
     def __init__(self, spec=None):
         self.spec = spec or VoxelSpec()
         self.voxelizer = RGBDVoxelizer(self.spec)
-        self.in_channels = self.spec.in_channels
+        # voxel_spec 在配置里是纯字典（非 VoxelSpec 实例），其 in_channels 是个 property，
+        # 字典上无此键会触发 omegaconf ConfigAttributeError。按 use_color 推算：开颜色=6，否则=3。
+        self.in_channels = 6 if getattr(self.spec, 'use_color', False) else 3
 
     def __call__(self, data):
         # 数据已自带预计算体素（'voxel'），无需再 voxelize，直接透传。
