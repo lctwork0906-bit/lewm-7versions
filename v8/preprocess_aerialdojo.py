@@ -254,25 +254,46 @@ def main():
         f.attrs['voxel_spec'] = json.dumps(vars(spec))
 
         if args.workers and args.workers > 1:
-            from concurrent.futures import ProcessPoolExecutor
-            # 分批提交，限制同时在飞的 episode 数（≈ workers 个），避免结果堆积撑爆内存
-            CH = max(args.workers, 8)
+            from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+            # 流式提交 + 有序落盘：
+            #  - MAX_INFLIGHT 限制同时在飞的 episode 数 → 内存上限可控（不会因 256 核爆内存）
+            #  - 任一 worker 完成立刻补一个新任务 → 256 核始终喂满
+            #  - ready 缓冲按全局序号有序 flush → 输出样本顺序与 episode 顺序一致
+            MAX_INFLIGHT = min(max(args.workers * 2, 16), 96)
+            pending = {}
+            ready = {}
+            next_i = 0
+            submitted = 0
+
+            def submit_more(ex, pending):
+                nonlocal submitted
+                while submitted < n_ep and len(pending) < MAX_INFLIGHT:
+                    fut = ex.submit(process_episode_core, episodes[submitted])
+                    pending[fut] = submitted
+                    submitted += 1
+
             with ProcessPoolExecutor(max_workers=args.workers) as ex:
-                for s in range(0, n_ep, CH):
-                    batch = episodes[s:s + CH]
-                    for j, (ep_id, evox, eact, etok) in enumerate(ex.map(process_episode_core, batch)):
-                        i = s + j
+                submit_more(ex, pending)
+                while pending:
+                    done, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        i = pending.pop(fut)
+                        ready[i] = fut.result()
+                        submit_more(ex, pending)
+                    while next_i in ready:
+                        i = next_i
+                        ep_id, evox, eact, etok = ready.pop(i)
                         if evox is None:
                             skipped += 1
                             print(f"[{i+1}/{n_ep}] SKIP {ep_id} (reached_goal=False) "
                                   f"elapsed={time.time()-t0:.1f}s", flush=True)
-                            continue
-                        if not evox:
+                        elif not evox:
                             skipped += 1
                             print(f"[{i+1}/{n_ep}] SKIP {ep_id} (no valid steps) "
                                   f"elapsed={time.time()-t0:.1f}s", flush=True)
-                            continue
-                        write_episode(vox_ds, act_ds, tok_ds, evox, eact, etok, i, n_ep, t0)
+                        else:
+                            write_episode(vox_ds, act_ds, tok_ds, evox, eact, etok, i, n_ep, t0)
+                        next_i += 1
         else:
             for i, ep in enumerate(episodes):
                 ep_id, evox, eact, etok = process_episode_core(ep)
